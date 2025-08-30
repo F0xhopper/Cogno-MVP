@@ -59,21 +59,14 @@ export async function upsertVectors(texts: string[], metadata: any[]) {
 
   const records = texts.map((text, i) => ({
     id: `chunk_${Date.now()}_${i}`,
-    values: [],
     chunk_text: text,
-    metadata: {
-      ...metadata[i],
-    },
+    source: metadata[i].source,
+    chunk_index: metadata[i].chunkIndex,
   }));
 
   const results = [];
   for (let i = 0; i < records.length; i += BATCH_SIZE) {
     const batch = records.slice(i, i + BATCH_SIZE);
-    console.log(
-      `Upserting batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(
-        records.length / BATCH_SIZE
-      )} (${batch.length} records)`
-    );
 
     const result = await index.upsertRecords(batch);
     results.push(result);

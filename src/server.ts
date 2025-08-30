@@ -8,15 +8,29 @@ import {
   upsertVectors,
 } from "./services/pinecone.ts";
 import { chunkText } from "./utils/chunk.ts";
-import { generateChunkMetadata } from "./services/rag.ts";
 import pdf from "pdf-parse";
+
+function parseMetadata(metadata: Record<string, any> | undefined) {
+  if (!metadata) {
+    return {
+      source: "unknown",
+      chunkIndex: 0,
+    };
+  }
+
+  return {
+    ...metadata,
+    source: metadata.source || "unknown",
+    chunkIndex: metadata.chunkIndex || 0,
+  };
+}
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 },
+  limits: { fileSize: 100 * 1024 * 1024 },
 });
 
 const UploadSchema = z.object({
@@ -42,8 +56,6 @@ app.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = req.body || {};
-      console.log("Request body:", body);
-      console.log("Request files:", req.files);
 
       const parsed = UploadSchema.safeParse(body);
       if (!parsed.success) {
@@ -85,21 +97,11 @@ app.post(
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           try {
-            const aiMetadata = await generateChunkMetadata(chunk);
-
             allChunks.push({
               text: chunk,
               metadata: {
                 source: file.originalname,
                 chunkIndex: i,
-
-                summary: aiMetadata.summary,
-                topics: aiMetadata.topics,
-                entities: aiMetadata.entities,
-                documentType: aiMetadata.documentType,
-                keyPoints: aiMetadata.keyPoints,
-                sentiment: aiMetadata.sentiment,
-                complexity: aiMetadata.complexity,
               },
             });
           } catch (error) {
@@ -110,12 +112,6 @@ app.post(
               metadata: {
                 source: file.originalname,
                 chunkIndex: i,
-                topics: ["general"],
-                entities: [],
-                documentType: "other",
-                keyPoints: [chunk.substring(0, 100) + "..."],
-                sentiment: "neutral",
-                complexity: "moderate",
               },
             });
           }
@@ -158,46 +154,162 @@ app.post("/query", async (req: Request, res: Response, next: NextFunction) => {
 
     const index = await getPineconeIndex();
 
+    console.log(`Searching for query: "${query}" in namespace: "${namespace}"`);
+
+    // Enhanced search with higher topK for better reranking
+    const searchTopK = Math.max(topK * 2, 10);
+
     const results = await index.searchRecords({
       query: {
         inputs: { text: query },
-        topK,
+        topK: searchTopK,
       },
-      fields: ["chunk_text", "metadata"],
+      fields: ["chunk_text", "source", "chunk_index"],
       rerank: {
         model: "bge-reranker-v2-m3",
-        topN: Math.min(topK, 5),
-        rankFields: [
-          "chunk_text",
-          "metadata.summary",
-          "metadata.topics",
-          "metadata.entities",
-        ],
+        topN: Math.min(searchTopK, 10),
+        rankFields: ["chunk_text"],
       },
     });
 
+    console.log(`Search results:`, JSON.stringify(results, null, 2));
     const matches = results.result.hits ?? [];
 
+    const parsedMatches = matches.map((match) => ({
+      ...match,
+      metadata: parseMetadata({
+        source: (match.fields as any)?.source,
+        chunkIndex: (match.fields as any)?.chunk_index,
+      }),
+      fields: match.fields || {},
+    }));
+
     let answer: string | undefined;
-    if (withAnswer && matches.length > 0) {
-      const contexts = matches
-        .map((m) => (m.fields as any).chunk_text)
-        .filter(Boolean)
-        .slice(0, 10);
+    let advancedRAGResult: any = undefined;
 
-      const prompt = `You are a helpful assistant. Using only the context below, answer the user question.\n\nContext:\n${contexts
-        .map((c, i) => `[${i + 1}] ${c ?? ""}`)
-        .join("\n\n")}\n\nQuestion: ${query}\n\nAnswer:`;
-
-      const { getChatCompletion } = await import("./services/rag.ts");
-      answer = await getChatCompletion(prompt);
+    if (withAnswer) {
+      if (parsedMatches.length > 0) {
+        // Use advanced RAG techniques
+        const { advancedRAGQuery } = await import("./services/advanced-rag.ts");
+        try {
+          advancedRAGResult = await advancedRAGQuery(
+            query,
+            parsedMatches,
+            topK
+          );
+          answer = advancedRAGResult.finalAnswer;
+        } catch (error) {
+          console.error("Error in advanced RAG:", error);
+          answer = "An error occurred while processing your request.";
+        }
+      } else {
+        answer =
+          "I don't have enough information in my knowledge base to answer this question accurately.";
+      }
     }
 
-    res.json({ ok: true, matches, answer });
+    const response: any = {
+      ok: true,
+      matches: parsedMatches,
+      answer,
+    };
+
+    // Include advanced RAG metadata if available
+    if (advancedRAGResult) {
+      response.advancedRAG = {
+        expandedQueries: advancedRAGResult.expandedQueries,
+        critiqueScore: advancedRAGResult.critiqueScore,
+        confidence: advancedRAGResult.confidence,
+        rerankedDocuments: advancedRAGResult.rerankedDocuments.length,
+      };
+    }
+
+    res.json(response);
   } catch (err) {
     next(err);
   }
 });
+
+// New endpoint for advanced RAG with detailed analysis
+app.post(
+  "/query/advanced",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const parsed = QuerySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: "Invalid parameters",
+          details: parsed.error.flatten(),
+        });
+      }
+      const { query, topK = 5, namespace = "default" } = parsed.data;
+
+      const index = await getPineconeIndex();
+
+      console.log(
+        `Advanced RAG query: "${query}" in namespace: "${namespace}"`
+      );
+
+      // Enhanced search with higher topK for better reranking
+      const searchTopK = Math.max(topK * 3, 15);
+
+      const results = await index.searchRecords({
+        query: {
+          inputs: { text: query },
+          topK: searchTopK,
+        },
+        fields: ["chunk_text", "source", "chunk_index"],
+        rerank: {
+          model: "bge-reranker-v2-m3",
+          topN: Math.min(searchTopK, 15),
+          rankFields: ["chunk_text"],
+        },
+      });
+
+      const matches = results.result.hits ?? [];
+      const parsedMatches = matches.map((match) => ({
+        ...match,
+        metadata: parseMetadata({
+          source: (match.fields as any)?.source,
+          chunkIndex: (match.fields as any)?.chunk_index,
+        }),
+        fields: match.fields || {},
+      }));
+
+      if (parsedMatches.length === 0) {
+        return res.json({
+          ok: true,
+          query,
+          message: "No relevant documents found",
+          advancedRAG: {
+            expandedQueries: [query],
+            critiqueScore: 0.0,
+            confidence: 0.0,
+            rerankedDocuments: [],
+            documents: [],
+          },
+        });
+      }
+
+      // Use advanced RAG techniques
+      const { advancedRAGQuery } = await import("./services/advanced-rag.ts");
+      const advancedRAGResult = await advancedRAGQuery(
+        query,
+        parsedMatches,
+        topK
+      );
+
+      res.json({
+        ok: true,
+        query,
+        advancedRAG: advancedRAGResult,
+        rawMatches: parsedMatches.slice(0, 5), // Include first 5 raw matches for comparison
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   console.error(err);
