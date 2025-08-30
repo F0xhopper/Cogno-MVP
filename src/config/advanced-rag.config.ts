@@ -26,6 +26,7 @@ export interface AdvancedRAGConfig {
     vectorWeight: number;
     keywordWeight: number;
     reciprocalRankFusion: boolean;
+    rrfK: number;
   };
 
   // Response synthesis settings
@@ -67,6 +68,7 @@ export const defaultAdvancedRAGConfig: AdvancedRAGConfig = {
     vectorWeight: 0.7,
     keywordWeight: 0.3,
     reciprocalRankFusion: true,
+    rrfK: 60,
   },
 
   synthesis: {

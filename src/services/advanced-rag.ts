@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { getAdvancedRAGConfig } from "../config/advanced-rag.config.js";
+import { getPineconeIndex } from "./pinecone.ts";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
@@ -74,7 +75,6 @@ export async function generateExpandedQueries(
   // Always include the original query
   return [originalQuery, ...queries];
 }
-
 
 /**
  * Critique the quality and relevance of retrieved documents and generated response
@@ -242,13 +242,71 @@ export async function advancedRAGQuery(
   );
   console.log("Generated expanded queries:", expandedQueries);
 
+  // Step 2: For each expanded query, perform Pinecone search and collect results
+  // If Pinecone is unavailable for some reason, fall back to provided vectorSearchResults
+  let fusedMatches: any[] = [];
+  try {
+    const index = await getPineconeIndex();
 
-  
+    const searchTopK = Math.max(topK * 3, 15);
 
-  // Step 3: Extract document texts from vector search results
-  console.log("Raw vector search results:", vectorSearchResults.length);
+    // Perform searches in parallel for all expanded queries
+    const perQueryResults = await Promise.all(
+      expandedQueries.map(async (q) => {
+        const results = await index.searchRecords({
+          query: {
+            inputs: { text: q },
+            topK: searchTopK,
+          },
+          fields: ["chunk_text", "source", "chunk_index"],
+          rerank: {
+            model: "bge-reranker-v2-m3",
+            topN: Math.min(searchTopK, 15),
+            rankFields: ["chunk_text"],
+          },
+        });
+        const hits = results.result.hits ?? [];
+        return hits;
+      })
+    );
 
-  const documents = vectorSearchResults
+    // Reciprocal Rank Fusion (RRF)
+    const k = config.hybridSearch.rrfK;
+    const scoreMap: Map<string, { score: number; hit: any }> = new Map();
+
+    for (const hits of perQueryResults) {
+      for (let rank = 0; rank < hits.length; rank++) {
+        const hit = hits[rank];
+        const id = String(
+          (hit as any).id ??
+            `${(hit as any).fields?.source}-${(hit as any).fields?.chunk_index}`
+        );
+        const contribution = 1 / (k + rank + 1);
+        const existing = scoreMap.get(id);
+        if (existing) {
+          existing.score += contribution;
+        } else {
+          scoreMap.set(id, { score: contribution, hit });
+        }
+      }
+    }
+
+    fusedMatches = Array.from(scoreMap.values())
+      .sort((a, b) => b.score - a.score)
+      .map((e) => e.hit)
+      .slice(0, Math.max(topK * 2, 10));
+  } catch (err) {
+    console.warn(
+      "Falling back to provided vectorSearchResults due to error:",
+      err
+    );
+    fusedMatches = vectorSearchResults ?? [];
+  }
+
+  // Step 3: Extract document texts from fused results
+  console.log("Raw fused search results:", fusedMatches.length);
+
+  const documents = fusedMatches
     .map((result: any) => (result.fields as any)?.chunk_text || "")
     .filter(Boolean);
 
@@ -262,7 +320,7 @@ export async function advancedRAGQuery(
       "I don't have enough information in my knowledge base to answer this question accurately.";
     return {
       query,
-      expandedQueries: [query],
+      expandedQueries,
       documents: [],
       rerankedDocuments: [],
       finalAnswer: answer,
